@@ -120,7 +120,6 @@ class NerLSTM(nn.Module):
     def __init__(self, embedding_matrix, hidden_size, number_of_labels, dropout):
         super(NerLSTM, self).__init__()
         self.name = "lstm"
-        # freeze=True: the vectors of TP1 are not modified, so the scores only depend on them
         self.embedding = nn.Embedding.from_pretrained(embedding_matrix, freeze=True, padding_idx=0)
         self.lstm = nn.LSTM(embedding_matrix.shape[1], hidden_size, batch_first=True, bidirectional=True)
         self.dropout = nn.Dropout(dropout)
@@ -232,7 +231,6 @@ for epoch in range(args.epochs):
     valid_f1 = f1_score(valid_true, valid_predicted)
     print(f"Epoch {epoch + 1}/{args.epochs} | train loss {total_loss / len(train_batches):.4f} | valid F1 {valid_f1:.4f}")
 
-    # we keep the model of the epoch with the best F1 on the validation set
     if valid_f1 > best_f1:
         best_f1 = valid_f1
         best_epoch = epoch + 1
