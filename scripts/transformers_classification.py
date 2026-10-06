@@ -1,205 +1,324 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-import numpy as np
-import pandas as pd
-from sklearn import metrics
-from sklearn.metrics import f1_score, roc_auc_score, accuracy_score, precision_score, recall_score, classification_report
-import transformers
-from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
-from transformers import TrainingArguments, AutoTokenizer, EvalPrediction, AutoModelForSequenceClassification, Trainer
-import sys
-import os
-import argparse
-import torch
-import ast
-from datasets import load_dataset, ClassLabel, Value, Sequence, load_from_disk
-from tqdm import tqdm
+import re
 import time
+import argparse
+from tqdm import tqdm
+from datasets import Dataset
+from seqeval.metrics import precision_score, recall_score, f1_score, accuracy_score
+from transformers import AutoTokenizer, AutoModelForTokenClassification, DataCollatorForTokenClassification, Trainer, TrainingArguments
+
+
 
 
 
 parser = argparse.ArgumentParser(description='Finetuning BERT kind models for multi-class classification')
-parser.add_argument('--model', type=str, help='Huggingface BERT model to be called', required=True)
-parser.add_argument('--train', metavar='csv', type=str, help='Train processed input saved directory', required=True)
-parser.add_argument('--test', metavar='csv', type=str, help='Test processed input saved directory', required=True)
-parser.add_argument('--valid', metavar='csv', type=str, help='Validation processed input saved directory', required=True)
+parser.add_argument('--model', type=str, help='Huggingface BERT model to be called', default="almanach/camembert-bio-base")
 parser.add_argument('--epochs',  type=int, help='Numbers of epochs (default 5)', default=5)
-parser.add_argument('--batch',  type=int, help='batch size (default 8)', default=8)
 parser.add_argument('--max_len',  type=int, help='maximum text length (default 128)', default=128)
+parser.add_argument('--batch',  type=int, help='batch size (default 8)', default=8)
 parser.add_argument('--lr',  type=float, help='learning rate (default 1e-05)', default=1e-05)
-
-
 
 args = parser.parse_args()
 
 
 bert_model = args.model
-MAX_LEN = args.max_len
 TRAIN_BATCH_SIZE = args.batch
 VALID_BATCH_SIZE = 4
 EPOCHS = args.epochs
 LEARNING_RATE = args.lr
 
-tokenizer = AutoTokenizer.from_pretrained(bert_model)
-train_binary = args.train + "_" + bert_model.replace("/","_") + "_" + str(MAX_LEN) + ".bin"
-valid_binary = args.valid + "_" + bert_model.replace("/","_") + "_" + str(MAX_LEN) + ".bin"
-test_binary = args.test + "_" + bert_model.replace("/","_") + "_" + str(MAX_LEN) + ".bin"
+# Data paths
+MED_TRAIN_DATA_PATH = "./TP_ISD2020/QUAERO_FrenchMed/MEDLINE/MEDLINEtrain_layer1_ID.conll"
+MED_VALID_DATA_PATH = "./TP_ISD2020/QUAERO_FrenchMed/MEDLINE/MEDLINEdev_layer1_ID.conll"
+MED_TEST_DATA_PATH = "./TP_ISD2020/QUAERO_FrenchMed/MEDLINE/MEDLINEtest_layer1_ID.conll"
+
+PRESS_TRAIN_DATA_PATH = "./TP_ISD2020/QUAERO_FrenchPress/fra4_ID.train"
+PRESS_VALID_DATA_PATH = "./TP_ISD2020/QUAERO_FrenchPress/fra4_ID.dev"
+PRESS_TEST_DATA_PATH = "./TP_ISD2020/QUAERO_FrenchPress/fra4_ID.test"
+
+def tokens_labels(data_path):
+    """Read a token-label file into aligned sentence-level lists."""
+    with open(data_path, "r", encoding="utf-8") as f:
+        data = f.readlines()
+
+    pattern = re.compile(r"^\d+\s+(\S+)\s+\S+\s+\S+\s+(\S+)")
+    tokens = []
+    labels = []
+    phrase = []
+    phrase_labels = []
+
+    for line in data:
+        match = pattern.search(line)
+        if match:
+            phrase.append(match.group(1))
+            phrase_labels.append(match.group(2))
+        else:
+            if phrase:
+                tokens.append(phrase)
+                labels.append(phrase_labels)
+            phrase = []
+            phrase_labels = []
+
+    return tokens, labels
 
 
+def prepare_ner_dataset(tokens, labels, model_name, label2id={}, id2label={}, train=True):
+    """Build and tokenize a Hugging Face dataset for token-level NER."""
+
+    # Check sentence alignment
+    assert len(tokens) == len(labels), (
+        f"Number of sentences differs: "
+        f"{len(tokens)} tokens vs {len(labels)} labels"
+    )
+
+    # Check token/label alignment
+    for i, (sentence_tokens, sentence_labels) in enumerate(
+        zip(tokens, labels)
+    ):
+        assert len(sentence_tokens) == len(sentence_labels), (
+            f"Sentence {i}: "
+            f"{len(sentence_tokens)} tokens vs {len(sentence_labels)} labels"
+        )
+
+    # Create label mappings only for the training dataset
+    if train:
+        label_names = sorted(
+            {
+                label
+                for sentence_labels in labels
+                for label in sentence_labels
+            }
+        )
+
+        label2id = {
+            label: i
+            for i, label in enumerate(label_names)
+        }
+
+        id2label = {
+            i: label
+            for label, i in label2id.items()
+        }
+
+    # Create Hugging Face dataset
+    dataset = Dataset.from_list([
+        {
+            "tokens": sentence_tokens,
+            "labels": sentence_labels
+        }
+        for sentence_tokens, sentence_labels
+        in zip(tokens, labels)
+    ])
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Tokenize and align NER labels with subtokens
+    def tokenize_and_align_labels(examples):
+        encoding = tokenizer(
+            examples["tokens"],
+            is_split_into_words=True,
+            truncation=True
+        )
+
+        aligned_labels = []
+
+        for batch_index in range(len(examples["tokens"])):
+            word_ids = encoding.word_ids(
+                batch_index=batch_index
+            )
+
+            sentence_labels = examples["labels"][batch_index]
+            label_ids = []
+            previous_word_id = None
+
+            for word_id in word_ids:
+
+                # Special tokens
+                if word_id is None:
+                    label_ids.append(-100)
+
+                # First subtoken of a word
+                elif word_id != previous_word_id:
+                    label_ids.append(
+                        label2id[sentence_labels[word_id]]
+                    )
+
+                # Other subtokens
+                else:
+                    label_ids.append(-100)
+
+                previous_word_id = word_id
+
+            aligned_labels.append(label_ids)
+
+        encoding["labels"] = aligned_labels
+        return encoding
+
+    # Apply tokenization to the dataset
+    dataset = dataset.map(
+        tokenize_and_align_labels,
+        batched=True
+    )
+
+    return dataset.remove_columns("tokens"), label2id, id2label, tokenizer
+
+# Prepare datasets and tokenizers for both MEDLINE and Press corpora
+med_train, med_label2id, med_id2label, med_tokenizer = prepare_ner_dataset(
+    *tokens_labels(MED_TRAIN_DATA_PATH),
+    model_name=bert_model
+)
+med_test, _, _, _ = prepare_ner_dataset(
+    *tokens_labels(MED_TEST_DATA_PATH),
+    model_name=bert_model, label2id=med_label2id, id2label=med_id2label, train=False
+)
+
+med_valid, _, _, _ = prepare_ner_dataset(
+	*tokens_labels(MED_VALID_DATA_PATH),
+	model_name=bert_model, label2id=med_label2id, id2label=med_id2label, train=False
+)
+
+press_train, press_label2id, press_id2label, press_tokenizer = prepare_ner_dataset(
+    *tokens_labels(PRESS_TRAIN_DATA_PATH),
+    model_name=bert_model
+)
+press_test, _, _, _ = prepare_ner_dataset(
+    *tokens_labels(PRESS_TEST_DATA_PATH),
+    model_name=bert_model, label2id=press_label2id, id2label=press_id2label, train=False
+)
+
+press_valid, _, _, _ = prepare_ner_dataset(
+	*tokens_labels(PRESS_VALID_DATA_PATH),
+	model_name=bert_model, label2id=press_label2id, id2label=press_id2label, train=False
+)
+
+#  NER training for medical data
+
+# Medical data collator and medical model
+med_data_collator = DataCollatorForTokenClassification(tokenizer=med_tokenizer)
+med_model =AutoModelForTokenClassification.from_pretrained(bert_model, num_labels=len(med_label2id), id2label=med_id2label, label2id=med_label2id)
+
+# Press data collator and press model
+press_data_collator = DataCollatorForTokenClassification(tokenizer=press_tokenizer)
+press_model = AutoModelForTokenClassification.from_pretrained(bert_model, num_labels=len(press_label2id), id2label=press_id2label, label2id=press_label2id)
 
 
-def string_list_2_list(x):
-    if type(x["label"][0]) == list:
-        x["label"] = list(map(ast.literal_eval,x["label"]))
-    return x
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    predictions = predictions.argmax(axis=-1)
 
-def encode(examples):
-#    print (examples) 
-    r = tokenizer(list(map(str, examples['review'])), padding=True, truncation=True, max_length=MAX_LEN)
-    #r = tokenizer(list(map(str, examples['text'])), padding=True, truncation=True, max_length=MAX_LEN)
-    return r
+    true_predictions = []
+    true_labels = []
 
-def preprocess_labels(examples):
-    if type(examples['label'][0]) == list:
-        examples['label'] = [[float(x) for x in label] for label in examples['label']]
-    else:
-        examples['label'] = [float(x) for x in examples['label']]
-    return examples
+    for prediction, label in zip(predictions, labels):
+        sentence_predictions = []
+        sentence_labels = []
 
-def padding(examples):
-    for key in ['input_ids', 'attention_mask']:
-        for i, element in enumerate(examples[key]):
-            if len(element) < MAX_LEN:
-                for i in range(MAX_LEN - len(element)):
-                    element.append(0)
-            else:
-                examples[key][i] = element[:MAX_LEN]
-    return examples
+        for pred, true in zip(prediction, label):
+            if true != -100:
+                sentence_predictions.append(med_id2label[pred])
+                sentence_labels.append(med_id2label[true])
 
+        true_predictions.append(sentence_predictions)
+        true_labels.append(sentence_labels)
 
-def preprocess_dataset(csvfile, binfile, kind='train'):
-    l_data = load_dataset('csv', data_files={kind: [csvfile]})
-    #data = load_dataset(csvfile, split=kind)
-    l_data = l_data.map(string_list_2_list, batched=True)
-    l_data = l_data.map(preprocess_labels, batched=True)
-    l_data = l_data.map(encode, batched=True)
-    new_features = l_data[kind].features.copy()
-    print(new_features)
-    if type(l_data[kind]["label"][0]) == list:
-        new_features["label"] = Sequence(feature=Value(dtype='float'))
-    else:
-        new_features["label"] = feature=Value(dtype='float')
-    print(new_features)
-    l_data = l_data[kind].cast(new_features)
-    l_data = l_data.map(padding, batched=True)
-    l_data.save_to_disk(binfile)
+    return {
+        "precision": precision_score(true_labels, true_predictions),
+        "recall": recall_score(true_labels, true_predictions),
+        "f1": f1_score(true_labels, true_predictions),
+        "accuracy": accuracy_score(true_labels, true_predictions),
+    }
+    
+def train_ner_model(model, train_dataset, valid_dataset, data_collator, epochs=EPOCHS, batch_size=TRAIN_BATCH_SIZE):
+	"""Train a Hugging Face NER model."""
+	# Training configuration
+	training_args = TrainingArguments(
+        output_dir="./ner_results",
+        num_train_epochs=epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        learning_rate=LEARNING_RATE,
+        weight_decay=0.01,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        logging_strategy="epoch",
+        report_to="none"
+    )
 
+    # Hugging Face training loop
+	trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=valid_dataset,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics
+    )
 
+    # Start training
+	trainer.train()
 
-if not os.path.exists(train_binary) :
-    preprocess_dataset(args.train, train_binary, kind='train')
-if not os.path.exists(valid_binary) :
-    preprocess_dataset(args.valid, valid_binary, kind='valid')
-if not os.path.exists(test_binary) :
-    preprocess_dataset(args.test, test_binary, kind='test')
+	return trainer
 
+"""print("Training NER model on medical data...")
 
+med_trainer = train_ner_model(
+    med_model,
+    med_train,
+    med_valid,
+    med_data_collator
+)
 
+med_trainer.save_model("models/med_model")
 
-data_train = load_from_disk(train_binary)
-data_test = load_from_disk(test_binary)
-data_valid = load_from_disk(valid_binary)
+print("Training NER model on press data...")
 
-def multi_label_metrics(predictions, labels, threshold=0.5):
-    # first, apply sigmoid on predictions which are of shape (batch_size, num_labels)
-    sigmoid = torch.nn.Sigmoid()
-    probs = sigmoid(torch.Tensor(predictions))
-    # next, use threshold to turn them into integer predictions
-    y_pred = np.zeros(probs.shape)
-    y_pred[np.where(probs >= threshold)] = 1
-    # finally, compute metrics
-    y_true = labels
-    f1_micro_average = f1_score(y_true=y_true, y_pred=y_pred, average='micro')
-    f1_macro_average = f1_score(y_true=y_true, y_pred=y_pred, average='macro')
-    precision_weighted_average = precision_score(y_true=y_true, y_pred=y_pred, average='weighted')
-    recall_average = recall_score(y_true=y_true, y_pred=y_pred, average='weighted')
-    f1_weighted_average = 2.0 * ((precision_weighted_average * recall_average) / ( precision_weighted_average + recall_average ))
-    roc_auc = roc_auc_score(y_true, y_pred, average = 'micro')
-    accuracy = accuracy_score(y_true, y_pred)
-    print(classification_report(y_pred, y_true))
-    # return as dictionary
-    metrics = {'precision weighted': precision_weighted_average,
-               'recall weighted': recall_average,
-               'f1 weighted': f1_weighted_average,
-               'accuracy': accuracy}
-    return metrics
+press_model.to("mps")
+press_trainer = train_ner_model(
+	press_model,
+	press_train,
+	press_valid,
+	press_data_collator
+)
 
-def multi_label_metrics_v2(predictions, labels, threshold=0.5):
-    # first, apply sigmoid on predictions which are of shape (batch_size, num_labels)
-    sigmoid = torch.nn.Sigmoid()
-    probs = sigmoid(torch.Tensor(predictions))
-    # next, use threshold to turn them into integer predictions
-    y_pred = np.zeros(probs.shape)
-    y_pred[np.where(probs >= threshold)] = 1
-    # finally, compute metrics
-    y_true = labels
-    return (classification_report(y_true, y_pred))
+press_trainer.save_model("models/press_model")
+"""
 
-def compute_metrics(p: EvalPrediction):
-    preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
-    result = multi_label_metrics(predictions=preds,labels=p.label_ids)
-    return result
+### Evaluation of the medical model on the test set
+print("Evaluation of the medical model on the test set...")
 
-def padding(examples):
-    for key in ['input_ids', 'attention_mask']:
-        for i, element in enumerate(examples[key]):
-            if len(element) < 20:
-                for i in range(20 - len(element)):
-                    element.append(0)
-            else:
-                examples[key][i] = element[:20]
-    return examples
+med_model = AutoModelForTokenClassification.from_pretrained(
+    "models/med_model"
+)
 
-data_train.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
-data_valid.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
-data_test.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+med_model.eval()
 
-print("TRAIN Dataset: {}".format(data_train.shape))
-print("VALID Dataset: {}".format(data_valid.shape))
-print("TEST Dataset: {}".format(data_test.shape))
+med_trainer = Trainer(
+    model=med_model,
+    eval_dataset=med_test,
+    data_collator=med_data_collator,
+    compute_metrics=compute_metrics
+)
 
-nb_labels = 1
-if type(data_test["label"][0]) == list:
-    nb_labels = len(data_test["label"][0])
-print(data_test["review"][0])
-print(data_test["label"][0])
+metrics = med_trainer.evaluate()
 
-model = AutoModelForSequenceClassification.from_pretrained(bert_model, num_labels=nb_labels)
-for name, param in model.named_parameters():
-    print(name, param.requires_grad)
+print(f"Metrics of the medical model: {metrics}")
 
-training_args = TrainingArguments(
-    f"finetune_" + bert_model.replace("/","_") + "_"+str(EPOCHS)+"_"+str(TRAIN_BATCH_SIZE),
-    evaluation_strategy = "epoch",
-    save_strategy = "epoch",
-    learning_rate=LEARNING_RATE,
-    per_device_train_batch_size=TRAIN_BATCH_SIZE,
-    per_device_eval_batch_size=TRAIN_BATCH_SIZE,
-    num_train_epochs=EPOCHS,
-    load_best_model_at_end=True)
-print(data_train)
-print(data_test)
+print("Evaluation of the press model on the test set...")
 
-trainer = Trainer(model=model, args=training_args, train_dataset=data_train, eval_dataset=data_valid, tokenizer=tokenizer, compute_metrics=compute_metrics)
-start = time.time()
-trainer.train()
-end = time.time()
-elapsed = end - start
+### Evaluation of the press model on the test set
 
-print("************** RESULTS for " + bert_model.replace("/","_") + " *****************")
-print("Training time: " + str(elapsed) + " ms")
-results_valid = trainer.evaluate(data_valid)
-print(results_valid)
-results_test = trainer.evaluate(data_test)
-print(results_test)
+press_model = AutoModelForTokenClassification.from_pretrained(
+    "models/press_model"
+)
+
+press_model.eval()
+
+press_trainer = Trainer(
+    model=press_model,
+    eval_dataset=press_test,
+    data_collator=press_data_collator,
+    compute_metrics=compute_metrics
+)
+
+metrics = press_trainer.evaluate()
+
+print(f"Metrics of the press model: {metrics}")
