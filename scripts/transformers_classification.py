@@ -3,6 +3,7 @@ import time
 import argparse
 from tqdm import tqdm
 from datasets import Dataset
+from sklearn.metrics import classification_report
 from seqeval.metrics import precision_score, recall_score, f1_score, accuracy_score
 from transformers import AutoTokenizer, AutoModelForTokenClassification, DataCollatorForTokenClassification, Trainer, TrainingArguments
 
@@ -201,32 +202,48 @@ press_data_collator = DataCollatorForTokenClassification(tokenizer=press_tokeniz
 press_model = AutoModelForTokenClassification.from_pretrained(bert_model, num_labels=len(press_label2id), id2label=press_id2label, label2id=press_label2id)
 
 
-def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    predictions = predictions.argmax(axis=-1)
+def make_compute_metrics(id2label):
 
-    true_predictions = []
-    true_labels = []
+    def compute_metrics(eval_pred):
+        predictions, labels = eval_pred
+        predictions = predictions.argmax(axis=-1)
 
-    for prediction, label in zip(predictions, labels):
-        sentence_predictions = []
-        sentence_labels = []
+        true_predictions = []
+        true_labels = []
 
-        for pred, true in zip(prediction, label):
-            if true != -100:
-                sentence_predictions.append(med_id2label[pred])
-                sentence_labels.append(med_id2label[true])
+        for prediction, label in zip(predictions, labels):
+            sentence_predictions = []
+            sentence_labels = []
 
-        true_predictions.append(sentence_predictions)
-        true_labels.append(sentence_labels)
+            for pred, true in zip(prediction, label):
+                if true != -100:
+                    sentence_predictions.append(id2label[pred])
+                    sentence_labels.append(id2label[true])
 
-    return {
-        "precision": precision_score(true_labels, true_predictions),
-        "recall": recall_score(true_labels, true_predictions),
-        "f1": f1_score(true_labels, true_predictions),
-        "accuracy": accuracy_score(true_labels, true_predictions),
-    }
-    
+            true_predictions.append(sentence_predictions)
+            true_labels.append(sentence_labels)
+
+        return {
+            "precision": precision_score(
+                true_labels,
+                true_predictions
+            ),
+            "recall": recall_score(
+                true_labels,
+                true_predictions
+            ),
+            "f1": f1_score(
+                true_labels,
+                true_predictions
+            ),
+            "accuracy": accuracy_score(
+                true_labels,
+                true_predictions
+            ),
+        }
+
+    return compute_metrics
+
 def train_ner_model(model, train_dataset, valid_dataset, data_collator, epochs=EPOCHS, batch_size=TRAIN_BATCH_SIZE):
 	"""Train a Hugging Face NER model."""
 	# Training configuration
@@ -250,7 +267,7 @@ def train_ner_model(model, train_dataset, valid_dataset, data_collator, epochs=E
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
         data_collator=data_collator,
-        compute_metrics=compute_metrics
+        compute_metrics=make_compute_metrics(model.config.id2label)
     )
 
     # Start training
@@ -258,7 +275,7 @@ def train_ner_model(model, train_dataset, valid_dataset, data_collator, epochs=E
 
 	return trainer
 
-"""print("Training NER model on medical data...")
+print("Training NER model on medical data...")
 
 med_trainer = train_ner_model(
     med_model,
@@ -280,7 +297,7 @@ press_trainer = train_ner_model(
 )
 
 press_trainer.save_model("models/press_model")
-"""
+
 
 ### Evaluation of the medical model on the test set
 print("Evaluation of the medical model on the test set...")
@@ -295,12 +312,12 @@ med_trainer = Trainer(
     model=med_model,
     eval_dataset=med_test,
     data_collator=med_data_collator,
-    compute_metrics=compute_metrics
+    compute_metrics=make_compute_metrics(med_id2label)
 )
 
 metrics = med_trainer.evaluate()
 
-print(f"Metrics of the medical model: {metrics}")
+print(f"Metrics of the medical model on {len(med_test)} test data points: {metrics}")
 
 print("Evaluation of the press model on the test set...")
 
@@ -316,9 +333,9 @@ press_trainer = Trainer(
     model=press_model,
     eval_dataset=press_test,
     data_collator=press_data_collator,
-    compute_metrics=compute_metrics
+    compute_metrics=make_compute_metrics(press_id2label)
 )
 
 metrics = press_trainer.evaluate()
 
-print(f"Metrics of the press model: {metrics}")
+print(f"Metrics of the press model on {len(press_test)} test data points: {metrics}")
