@@ -28,4 +28,4 @@ fra4_ID.train,cnn,w2v_cbow_med,40,0.3715,0.1981,0.2584
 fra4_ID.train,cnn,w2v_cbow_press,31,0.6044,0.4301,0.5026
 fra4_ID.train,cnn,w2v_skipgram_med,40,0.4278,0.2334,0.3020
 fra4_ID.train,cnn,w2v_skipgram_press,28,0.6106,0.4125,0.4924
-fra4,camembert-base,bert,5,0.8361,0.7965,0.8158
+fra4,camembert-base,bert,5,0.9846,0.9849,0.9848

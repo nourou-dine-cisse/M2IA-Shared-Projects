@@ -249,6 +249,6 @@ print(f"Test | precision {precision:.4f} | recall {recall:.4f} | F1 {f1:.4f}")
 print(classification_report(test_true, test_predicted, digits=4))
 
 embeddings_name = args.embeddings.split("/")[-1].replace(".bin", "")
-dataset_name = args.train.split("/")[-1]
+test_file_name = args.test.split("/")[-1]
 with open(args.results, "a") as f:
-    f.write(f"{dataset_name},{args.model},{embeddings_name},{best_epoch},{precision:.4f},{recall:.4f},{f1:.4f}\n")
+    f.write(f"{test_file_name},{args.model},{embeddings_name},{best_epoch},{precision:.4f},{recall:.4f},{f1:.4f}\n")
